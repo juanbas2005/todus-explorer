@@ -31,3 +31,4 @@ Thumbs.db
 # Logs
 *.log
 nohup.out
+RENDER_API_KEY.txt

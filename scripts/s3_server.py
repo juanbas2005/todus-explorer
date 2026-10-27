@@ -5,14 +5,15 @@
   Abre http://localhost:8080 en el navegador.
   🔗 copia enlaces · 🗑️ elimina · ▶ Ver videos en el navegador
 """
-import http.server, json, os, socketserver, subprocess, sys, urllib.parse, xml.etree.ElementTree as ET
+import http.server, json, os, signal, socketserver, subprocess, sys, urllib.parse, xml.etree.ElementTree as ET
 from urllib.parse import quote
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 BASE = "https://s3.todus.cu/stream"
 S3S  = "https://s3.todus.cu/stream"
-PORT = 8080
-HOST = "0.0.0.0"
+# Render asigna PORT dinámicamente (10000 en free tier); default 8080 para local
+PORT = int(os.environ.get("PORT", 8080))
+HOST = os.environ.get("HOST", "0.0.0.0")
 NS   = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".flv", ".wmv", ".3gp", ".ogv"}
@@ -418,16 +419,23 @@ if __name__ == "__main__":
     srv = ReusableTCPServer((HOST, PORT), Handler)
     url = f"http://localhost:{PORT}"
 
+    # Ignore SIGTERM (Render lo usa para detener) → shutdown limpio
+    def _ign(sig, frame): pass
+    signal.signal(signal.SIGTERM, _ign)
+
     print(f"""
   ╔══════════════════════════════════════════╗
   ║  🌐 ToDus S3 Browser — puerto {PORT}         ║
-  ║  {url}
+  ║  http://localhost:{PORT}
   ║
-  ║  ▶ Videos: stream en el navegador        ║
+  ║  ▶ Videos: stream sin gastar megas       ║
   ║  Ctrl+C para detener
   ╚══════════════════════════════════════════╝
 """)
-    print(f"  Abre {url} en tu navegador")
+    if os.environ.get("RENDER"):
+        print("  Corriendo en Render ✅")
+    else:
+        print(f"  Abre http://localhost:{PORT} en tu navegador")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

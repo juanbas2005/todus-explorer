@@ -1,0 +1,18 @@
+# render.yaml — Despliegue automático en Render
+# Uso: Push a GitHub → Render detecta cambios → redeploy automático
+# En Render.com: New → Blueprint → Conecta este repo
+
+services:
+  - type: web
+    name: todus-explorer
+    env: python
+    region: ohio  # más cerca de Cuba
+    plan: free
+    pythonVersion: "3.13"
+    startCommand: cd scripts && python3 s3_server.py
+    healthCheckPath: /browse/
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
