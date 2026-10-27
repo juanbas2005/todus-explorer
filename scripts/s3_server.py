@@ -258,15 +258,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         print(f"  {self.client_address[0]} — {fmt % args}")
 
     def send_html(self, body, code=200):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # navegador cerró la pestaña, inofensivo
+
+    def log_req(self, msg, ip=None):
+        who = ip or self.client_address[0] if hasattr(self, "client_address") else "?"
+        print(f"  [{who}] {msg}", file=sys.stderr, flush=True)
 
     # ── Video streaming proxy (fuerza content-type correcto) ──────────────────
     def stream_s3(self, key):
+        import sys as _sys
         # Trucos udyat: IP gratuita + Host header + UA + TLS permisivo
         # Así NO se usan megas cuando estás en ETECSA móvil
         # quote() es CRÍTICO: sin esto curl recibe espacios en la URL
@@ -290,6 +298,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         r = subprocess.run(cmd, capture_output=True)
         raw = r.stdout
+
+        # Log del request curl (que fue a S3 via udyat)
+        rh = self.headers.get("Range")
+        rng = f" Range={rh}" if rh else ""
+        via = f"[UDYAT → {IP}]" if IP else "[S3]"
+        if r.returncode != 0:
+            print(f"  {via} ❌ {key[:55]}{rng} → curl falló ({r.returncode})", file=sys.stderr, flush=True)
+            self.send_html(b"<h1>502 Bad Gateway</h1>", 502)
+            return
 
         # Extraer headers y body: doble CRLF separa headers del cuerpo
         sep = raw.find(b"\r\n\r\n")
@@ -317,12 +334,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", cl)
-        self.send_header("Accept-Ranges", "bytes")
-        if cr: self.send_header("Content-Range", cr)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", cl)
+            self.send_header("Accept-Ranges", "bytes")
+            if cr: self.send_header("Content-Range", cr)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # navegador cerró, inofensivo
 
     # ── GET routes ───────────────────────────────────────────────────────────
     def do_GET(self):
