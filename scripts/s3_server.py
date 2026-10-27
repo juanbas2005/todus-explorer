@@ -5,12 +5,18 @@
   Abre http://localhost:8080 en el navegador.
   🔗 copia enlaces · 🗑️ elimina · ▶ Ver videos en el navegador
 """
-import http.server, json, os, signal, socketserver, subprocess, sys, urllib.parse, xml.etree.ElementTree as ET
+import http.server, json, os, signal, socketserver, ssl, subprocess, sys, urllib.parse, xml.etree.ElementTree as ET
 from urllib.parse import quote
+import socket as _socket
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 BASE = "https://s3.todus.cu/stream"
 S3S  = "https://s3.todus.cu/stream"
+
+# Sistema UDYAT: IP zero-rated de ETECSA (no gasta megas en datos móviles de Cuba)
+UDYAT_IP   = "152.207.206.86"
+UDYAT_IP2  = "152.207.206.88"   # DNS actual / respaldo
+TODUS_HOST = "s3.todus.cu"
 # Render asigna PORT dinámicamente (10000 en free tier); default 8080 para local
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -37,25 +43,100 @@ def curl(url, method=None, extra=None):
     if extra:  cmd += extra
     return subprocess.run(cmd, capture_output=True, text=True).stdout
 
-def list_keys(prefix=""):
+def list_objects(prefix="", max_objects=2000):
+    """Lista objetos ({key, size, mtime}) con paginación automática.
+
+    Se detiene en max_objects para no eternizarse en buckets enormes.
+    Devuelve (objs, truncated).
+    """
     enc = quote(prefix, safe="")
-    marker, keys = "", []
-    while True:
+    marker, objs, truncated = "", [], False
+    while len(objs) < max_objects:
+        url = f"{BASE}?list-type=2&prefix={enc}&max-keys=1000"
         if marker:
-            url = f"{BASE}?list-type=2&prefix={enc}&continuation-token={quote(marker)}&max-keys=1000"
-        else:
-            url = f"{BASE}?list-type=2&prefix={enc}&max-keys=1000"
+            url += f"&continuation-token={quote(marker)}"
         page = curl(url)
-        root = ET.fromstring(page)
+        try:
+            root = ET.fromstring(page)
+        except ET.ParseError:
+            break
         for c in root.findall(f"{{{NS}}}Contents"):
-            keys.append(c.find(f"{{{NS}}}Key").text)
+            key_el = c.find(f"{{{NS}}}Key")
+            if key_el is None or not key_el.text:
+                continue
+            size_el = c.find(f"{{{NS}}}Size")
+            lm_el   = c.find(f"{{{NS}}}LastModified")
+            objs.append({
+                "key": key_el.text,
+                "size": int(size_el.text) if size_el is not None and size_el.text else None,
+                "mtime": lm_el.text if lm_el is not None else None,
+            })
+            if len(objs) >= max_objects:
+                truncated = True
+                break
         trunc = root.find(f"{{{NS}}}IsTruncated")
         nxt   = root.find(f"{{{NS}}}NextContinuationToken")
-        if trunc is not None and trunc.text == "true" and nxt is not None and nxt.text:
-            marker = nxt.text
-        else:
+        if truncated or trunc is None or trunc.text != "true" or nxt is None or not nxt.text:
             break
-    return keys
+        marker = nxt.text
+    return objs, truncated
+
+def list_keys(prefix=""):
+    objs, _ = list_objects(prefix)
+    return [o["key"] for o in objs]
+
+# ─── Conexiones UDYAT (socket TLS directo, sin curl) ─────────────────────────
+def _http_get_request(path, range_header, host):
+    req = (f"GET {path} HTTP/1.1\r\n"
+           f"Host: {host}\r\n"
+           f"User-Agent: Wget/1.21.3\r\n"          # UA exacto del sistema UDYAT
+           f"Accept: */*\r\n"
+           f"Accept-Encoding: identity\r\n")       # sin gzip: streaming limpio
+    if range_header:
+        req += f"Range: {range_header}\r\n"
+    req += "Connection: close\r\n\r\n"
+    return req.encode()
+
+def open_udyat_conn(path, range_header=None, timeout=5):
+    """Abre TLS directo a la IP zero-rated con SNI/Host correctos.
+
+    Trucos udyat aplicados: IP directa (1), SNI+Host (2), UA (3),
+    TLS permisivo (4) y HTTP/1.1 (5). Devuelve el socket o None.
+    """
+    for ip in (UDYAT_IP, UDYAT_IP2):
+        try:
+            raw = _socket.create_connection((ip, 443), timeout=timeout)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE      # cert self-signed de la IP
+            tls = ctx.wrap_socket(raw, server_hostname=TODUS_HOST)
+            tls.sendall(_http_get_request(path, range_header, TODUS_HOST))
+            tls.settimeout(30)
+            return tls
+        except Exception as e:
+            print(f"  [UDYAT] {ip} falló: {e}", file=sys.stderr, flush=True)
+    return None
+
+def open_direct_conn(path, range_header=None, timeout=10):
+    """Fallback: TLS con DNS normal del sistema (gasta megas, pero funciona)."""
+    try:
+        raw = _socket.create_connection((TODUS_HOST, 443), timeout=timeout)
+        ctx = ssl.create_default_context()       # cert oficial es válido
+        tls = ctx.wrap_socket(raw, server_hostname=TODUS_HOST)
+        tls.sendall(_http_get_request(path, range_header, TODUS_HOST))
+        tls.settimeout(30)
+        return tls
+    except Exception as e:
+        print(f"  [S3 directo] falló: {e}", file=sys.stderr, flush=True)
+        return None
+
+def s3_reachable(timeout=8):
+    """HEAD barato para /api/health: ¿S3 responde?"""
+    code = subprocess.run(
+        ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-m", str(timeout),
+         f"{BASE}?list-type=2&max-keys=1"],
+        capture_output=True, text=True).stdout.strip()
+    return code
 
 def key_head(key):
     r = subprocess.run(
@@ -156,7 +237,7 @@ def page_header(path, title=""):
 <body>
 <header>
   <h1>📦 ToDus S3 Browser</h1>
-  <span class="info">{S3S}/stream</span>
+  <span class="info">{S3S}</span>
 </header>
 <div class="pathbar">{nav_links(path)}</div>
 <div class="container">
@@ -209,15 +290,15 @@ def make_row(typ, name, full_key, size, mtime, url):
             f'<td style="white-space:nowrap">{video_btn}{copy_btn} {del_btn}</td></tr>')
 
 def build_page(path, flash_msg="", flash_cls=""):
-    keys = list_keys(path)
+    objs, truncated = list_objects(path)
     subfolders, files = {}, []
-    for k in keys:
-        rest = k[len(path):].lstrip("/")
+    for o in objs:
+        rest = o["key"][len(path):].lstrip("/")
         parts = rest.split("/", 1)
         if len(parts) > 1 and parts[0]:
             subfolders[parts[0] + "/"] = subfolders.get(parts[0] + "/", 0) + 1
         elif rest:
-            files.append(k)
+            files.append(o)
 
     flash = f'<div class="flash {flash_cls}">{flash_msg}</div>' if flash_msg else ""
     total = len(files) + len(subfolders)
@@ -225,7 +306,7 @@ def build_page(path, flash_msg="", flash_cls=""):
     parent = parent + "/" if parent else ""
 
     html = page_header(path)
-    html += f'<div class="count">{total} objetos</div>'
+    html += f'<div class="count">{total} objetos{" (truncado)" if truncated else ""}</div>'
     html += '<div class="actions-bar">'
     html += f'<a href="/browse/" class="btn refresh">🔄 Actualizar</a>'
     if path:
@@ -233,7 +314,7 @@ def build_page(path, flash_msg="", flash_cls=""):
     html += '<span class="hint">▶ Ver video · 🔗 Copiar · 🗑️ Eliminar</span>'
     html += '</div>' + flash
 
-    if not keys:
+    if not objs:
         html += '<div class="empty">Carpeta vacía</div>'
     else:
         html += ('<table><thead><tr><th>Nombre</th><th class="size">Tamaño</th>'
@@ -241,10 +322,10 @@ def build_page(path, flash_msg="", flash_cls=""):
         for sf in sorted(subfolders):
             sf_key = path + sf
             html += make_row("folder", sf.rstrip("/"), sf_key, subfolders[sf], "", "")
-        for k in sorted(files):
-            fname = k.split("/")[-1]
-            # key_head solo en la página del reproductor (es lento)
-            html += make_row("file", fname, k, None, None, f"{S3S}/{quote(k)}")
+        for o in sorted(files, key=lambda x: x["key"]):
+            fname = o["key"].split("/")[-1]
+            # tamaño y fecha vienen gratis del listing (sin HEAD extra)
+            html += make_row("file", fname, o["key"], o["size"], o["mtime"], f"{S3S}/{quote(o['key'])}")
         html += '</tbody></table>'
 
     html += page_footer()
@@ -272,80 +353,104 @@ class Handler(http.server.BaseHTTPRequestHandler):
         who = ip or self.client_address[0] if hasattr(self, "client_address") else "?"
         print(f"  [{who}] {msg}", file=sys.stderr, flush=True)
 
-    # ── Video streaming proxy (fuerza content-type correcto) ──────────────────
-    def stream_s3(self, key):
-        import sys as _sys
-        # Trucos udyat: IP gratuita + Host header + UA + TLS permisivo
-        # Así NO se usan megas cuando estás en ETECSA móvil
-        # quote() es CRÍTICO: sin esto curl recibe espacios en la URL
-        # y los interpreta como separador de argumentos → "bad range in position"
-        path = f"/stream/{quote(key)}"
-        IP = "152.207.206.86"
-        rh = self.headers.get("Range")
-        cmd = [
-            "curl", "-sS", "-m", "60", "-D", "-", "-o", "-",
-            "--http1.1", "--insecure",
-            "-A", "Wget/1.21.3",
-            "-H", "Host: s3.todus.cu",
-            "-H", "Accept: */*",
-            "-H", "Accept-Encoding: identity",
-            "-H", "Connection: keep-alive",
-        ]
-        if rh: cmd += ["-H", f"Range: {rh}"]
-        # --resolve fuerza DNS a la IP gratuita
-        cmd += ["--resolve", f"s3.todus.cu:443:{IP}",
-                f"https://s3.todus.cu{path}"]
-
-        r = subprocess.run(cmd, capture_output=True)
-        raw = r.stdout
-
-        # Log del request curl (que fue a S3 via udyat)
-        rh = self.headers.get("Range")
-        rng = f" Range={rh}" if rh else ""
-        via = f"[UDYAT → {IP}]" if IP else "[S3]"
-        if r.returncode != 0:
-            print(f"  {via} ❌ {key[:55]}{rng} → curl falló ({r.returncode})", file=sys.stderr, flush=True)
-            self.send_html(b"<h1>502 Bad Gateway</h1>", 502)
-            return
-
-        # Extraer headers y body: doble CRLF separa headers del cuerpo
-        sep = raw.find(b"\r\n\r\n")
-        if sep < 0:
-            self.send_html(b"<h1>502 Bad Gateway</h1>", 502)
-            return
-        body = raw[sep + 4:]
-        hdr_raw = raw[:sep]
-
-        # Parsear headers S3
-        s3h = {}
-        for line in hdr_raw.decode().split("\r\n"):
-            if ":" not in line: continue
-            k, v = line.split(":", 1)
-            s3h[k.strip().lower()] = v.strip()
-
-        st_key = next((k for k in ("http/2", "http/1.1") if k in s3h), "http/1.1")
-        st_text = s3h.get(st_key, "200")
-        status = int(st_text.split()[0]) if st_text.strip() else 200
-
-        ct = mime_for_key(key)
-        cl = s3h.get("content-length", str(len(body)))
-        cr = s3h.get("content-range", "")
-
-        self.send_response(status)
-        self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", cl)
+    def send_json(self, body, code=200):
+        """Respuesta JSON con CORS abierto (para la app S3-TV y otros clientes)."""
         try:
-            self.send_response(status)
-            self.send_header("Content-Type", ct)
-            self.send_header("Content-Length", cl)
-            self.send_header("Accept-Ranges", "bytes")
-            if cr: self.send_header("Content-Range", cr)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", len(body))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass  # navegador cerró, inofensivo
+            pass
+
+    # ── Video streaming proxy (socket TLS directo, udyat + fallback) ─────────
+    def stream_s3(self, key):
+        """Streamea el objeto de S3 al cliente usando el sistema UDYAT.
+
+        Trucos udyat (replicados con socket TLS, sin curl):
+          1. Conexión directa a la IP gratuita (sin DNS público)
+          2. SNI + Host: s3.todus.cu
+          3. User-Agent: Wget/1.21.3
+          4. TLS permisivo (cert self-signed de la IP gratuita)
+          5. HTTP/1.1
+
+        Si la IP udyat no responde (WiFi / fuera de Cuba / Render), hace
+        fallback a conexión directa con DNS normal (gasta megas pero funciona).
+        El body se streamea por chunks — nunca se carga el video en RAM.
+        """
+        path = f"/stream/{quote(key)}"
+        rh = self.headers.get("Range")
+
+        tls = open_udyat_conn(path, rh)
+        mode, via = "NO_MEGAS", f"[UDYAT → {UDYAT_IP}]"
+        if tls is None:
+            tls = open_direct_conn(path, rh)
+            mode, via = "DIRECTO", "[S3 directo]"
+        if tls is None:
+            print(f"  {via} ❌ {key[:55]} → S3 inalcanzable", file=sys.stderr, flush=True)
+            self.send_html(b"<h1>502 Bad Gateway</h1>", 502)
+            return
+
+        try:
+            # Leer headers de la respuesta S3 (hasta doble CRLF, cap 64 KB)
+            buf = b""
+            while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                chunk = tls.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+            sep = buf.find(b"\r\n\r\n")
+            if sep < 0:
+                self.send_html(b"<h1>502 Bad Gateway</h1>", 502)
+                return
+            hdr_raw = buf[:sep].decode("utf-8", "replace")
+            first_body = buf[sep + 4:]
+
+            status, s3h = 200, {}
+            for line in hdr_raw.split("\r\n"):
+                if line.startswith("HTTP"):
+                    try: status = int(line.split()[1])
+                    except (IndexError, ValueError): pass
+                elif ":" in line:
+                    k, v = line.split(":", 1)
+                    s3h[k.strip().lower()] = v.strip()
+
+            ct = mime_for_key(key)
+            cl = s3h.get("content-length")
+            cr = s3h.get("content-range", "")
+
+            # UNA sola respuesta (antes se enviaba la status line dos veces)
+            self.send_response(status)
+            self.send_header("Content-Type", ct)
+            if cl: self.send_header("Content-Length", cl)
+            self.send_header("Accept-Ranges", "bytes")
+            if cr: self.send_header("Content-Range", cr)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            sent = 0
+            if first_body:
+                self.wfile.write(first_body)
+                sent += len(first_body)
+            while True:
+                chunk = tls.recv(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                sent += len(chunk)
+            rng = f" Range={rh}" if rh else ""
+            print(f"  {via} ✅ {key[:55]}{rng} → {sent} bytes ({mode})", file=sys.stderr, flush=True)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # cliente cerró la conexión, inofensivo
+        except Exception as e:
+            print(f"  {via} ❌ {key[:55]} → {e}", file=sys.stderr, flush=True)
+        finally:
+            try: tls.close()
+            except Exception: pass
 
     # ── GET routes ───────────────────────────────────────────────────────────
     def do_GET(self):
@@ -354,6 +459,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Raíz → lista buckets
         if path in ("/", "/index.html", "/browse"):
             self.send_html(build_page(""))
+            return
+
+        # ── API JSON para la app S3-TV ────────────────────────────────────────
+        if path.startswith("/api/health"):
+            import time as _time
+            code = s3_reachable()
+            self.send_json(json.dumps({
+                "ok": True,
+                "service": "todus-explorer",
+                "s3_status": code,
+                "s3_reachable": code in ("200", "206"),
+                "udyat_ip": UDYAT_IP,
+                "time": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            }, ensure_ascii=False).encode())
+            return
+
+        if path.startswith("/api/list"):
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(path).query)
+            prefix = qs.get("prefix", [""])[0]
+            if prefix and not prefix.endswith("/"):
+                prefix += "/"
+            try:
+                limit = min(int(qs.get("limit", ["2000"])[0]), 5000)
+            except ValueError:
+                limit = 2000
+            try:
+                objs, truncated = list_objects(prefix, max_objects=limit)
+            except Exception as e:
+                self.send_json(json.dumps({"error": str(e)}).encode(), 502)
+                return
+            folders, files = {}, []
+            for o in objs:
+                rest = o["key"][len(prefix):]
+                if "/" in rest:
+                    name = rest.split("/", 1)[0]
+                    if name:
+                        folders[name] = folders.get(name, 0) + 1
+                elif rest:
+                    files.append(o)
+            data = {
+                "prefix": prefix,
+                "folders": [{"name": n, "key": prefix + n + "/", "count": c}
+                            for n, c in sorted(folders.items())],
+                "files": [{"name": o["key"].split("/")[-1], "key": o["key"],
+                           "size": o["size"], "mtime": (o["mtime"] or "")[:10],
+                           "is_video": is_video(o["key"])}
+                          for o in sorted(files, key=lambda x: x["key"])],
+                "total": len(folders) + len(files),
+                "truncated": truncated,
+            }
+            self.send_json(json.dumps(data, ensure_ascii=False).encode())
             return
 
         # Stream de video (forza content-type)
