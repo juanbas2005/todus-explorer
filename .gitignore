@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Downloads and test files
+*.mp4
+*.rar
+*.bin
+*.html
+
+# Downloaded files
+udyat-downloads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs
+*.log
+nohup.out
