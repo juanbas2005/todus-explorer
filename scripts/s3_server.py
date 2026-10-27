@@ -268,7 +268,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def stream_s3(self, key):
         # Trucos udyat: IP gratuita + Host header + UA + TLS permisivo
         # Así NO se usan megas cuando estás en ETECSA móvil
-        path = f"/stream/{key}"
+        # quote() es CRÍTICO: sin esto curl recibe espacios en la URL
+        # y los interpreta como separador de argumentos → "bad range in position"
+        path = f"/stream/{quote(key)}"
         IP = "152.207.206.86"
         rh = self.headers.get("Range")
         cmd = [
@@ -425,7 +427,7 @@ if __name__ == "__main__":
   ║  Ctrl+C para detener
   ╚══════════════════════════════════════════╝
 """)
-    threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+    print(f"  Abre {url} en tu navegador")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
